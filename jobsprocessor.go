@@ -1,5 +1,14 @@
 package jobsprocessor
 
+import (
+	"hash"
+	"hash/fnv"
+	"log"
+	"sync"
+
+	"github.com/pkg/errors"
+)
+
 // Options for creating Processor
 type Options struct {
 	WorkersCount         int
@@ -11,16 +20,12 @@ type Processor struct {
 	workersCount         int
 	workerJobsBufferSize int
 
-	jobsChan          chan *job
-	workersInProgress map[SyncKey]*worker
-	releaseWorker     chan *worker
+	jobsChan chan *job
+	workers  []*worker
+
+	hasher hash.Hash32
+	sync.Mutex
 }
-
-// SyncKey - all jobs with this key will be processing synchronously
-type SyncKey = interface{}
-
-// Callback for processing data
-type Callback func(data interface{})
 
 type job struct {
 	syncKey  SyncKey
@@ -29,28 +34,30 @@ type job struct {
 }
 
 type worker struct {
-	syncKey       SyncKey
-	jobs          chan *job
-	releaseSignal chan *worker
+	jobs chan *job
 }
+
+// SyncKey - all jobs with this key will be processing synchronously
+type SyncKey = string
+
+// Callback for processing data
+type Callback func(data interface{})
 
 // Create Processor
 func Create(options Options) *Processor {
 	p := &Processor{
 		jobsChan:             make(chan *job),
-		releaseWorker:        make(chan *worker),
 		workerJobsBufferSize: options.WorkerJobsBufferSize,
 		workersCount:         options.WorkersCount,
-		workersInProgress:    make(map[SyncKey]*worker, options.WorkersCount),
+		hasher:               fnv.New32(),
+		workers:              make([]*worker, options.WorkersCount),
 	}
-	for i := 0; i < options.WorkersCount; i++ {
-		go func() {
-			p.releaseWorker <- &worker{
-				syncKey:       struct{}{},
-				jobs:          make(chan *job, p.workerJobsBufferSize),
-				releaseSignal: p.releaseWorker,
-			}
-		}()
+	for i := range p.workers {
+		p.workers[i] = &worker{
+			jobs: make(chan *job, p.workerJobsBufferSize),
+		}
+
+		go p.workers[i].work()
 	}
 
 	go p.start()
@@ -69,19 +76,27 @@ func (p *Processor) Process(syncKey SyncKey, data interface{}, callback Callback
 
 func (p *Processor) start() {
 	for j := range p.jobsChan {
-		if worker, inProgress := p.workersInProgress[j.syncKey]; inProgress {
-			worker.addJob(j)
-		} else {
-			releasedWorker := <-p.releaseWorker
-			delete(p.workersInProgress, releasedWorker.syncKey)
-
-			releasedWorker.syncKey = j.syncKey
-			p.workersInProgress[releasedWorker.syncKey] = releasedWorker
-
-			releasedWorker.addJob(j)
-			go releasedWorker.work()
-		}
+		p.assignWorker(j)
 	}
+}
+
+func (p *Processor) assignWorker(j *job) {
+	workerID := p.getWorkerIDForSyncKey(j.syncKey)
+	assignedWorker := p.workers[workerID]
+	assignedWorker.addJob(j)
+}
+
+func (p *Processor) getWorkerIDForSyncKey(key SyncKey) uint32 {
+	p.Lock()
+	defer p.Unlock()
+
+	p.hasher.Reset()
+	_, err := p.hasher.Write([]byte(key))
+	if err != nil {
+		log.Fatal(errors.Wrap(err, "jobsprocessor getWorkerIdForSyncKey error #1"))
+	}
+
+	return p.hasher.Sum32() % uint32(len(p.workers))
 }
 
 func (w *worker) addJob(j *job) {
@@ -89,20 +104,7 @@ func (w *worker) addJob(j *job) {
 }
 
 func (w *worker) work() {
-	for {
-	loop:
-		select {
-		case j := <-w.jobs:
-			j.callback(j.data)
-		default:
-			select {
-			case w.releaseSignal <- w:
-				return
-			case j := <-w.jobs:
-				j.callback(j.data)
-				break loop
-			}
-
-		}
+	for j := range w.jobs {
+		j.callback(j.data)
 	}
 }

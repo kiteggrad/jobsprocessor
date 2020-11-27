@@ -3,6 +3,7 @@ package jobsprocessor
 import (
 	"reflect"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 )
@@ -33,7 +34,7 @@ func Test(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(usersCount * messagesByUser)
 	for mess := range queue {
-		p.Process(mess.user, mess, func(data interface{}) {
+		p.Process(strconv.Itoa(mess.user), mess, func(data interface{}) {
 			mess := data.(*message)
 			m.Lock()
 			result[mess.user] = append(result[mess.user], mess.data)
